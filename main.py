@@ -24,6 +24,9 @@ async def startup_event():
     os.environ['VERCEL_BLOB_STORE_ID'] = os.environ['BLOB_STORE_ID']
     os.environ['VERCEL_BLOB_TOKEN'] = os.environ['BLOB_TOKEN']
 
+@app.get("/")
+async def root():
+    return {"greeting": "Hello, World!", "message": "Welcome to FastAPI!"}
 
 @app.post("/process-pdf")
 async def create_processing_job(request: ProcessRequest, background_tasks: BackgroundTasks):
