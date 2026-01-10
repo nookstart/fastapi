@@ -11,7 +11,7 @@ app = FastAPI()
 
 # I-define ang itsura ng request body
 class ProcessRequest(BaseModel):
-    pdf_url: str
+    pdf_file_id: str
     issue_name: str
 
 @app.on_event("startup")
