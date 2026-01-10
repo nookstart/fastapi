@@ -1,2 +1,7 @@
 fastapi==0.100.0
 hypercorn==0.14.4
+fitz==0.0.1.dev2
+requests
+vercel_blob==0.4.2
+typing==3.7.4.3
+pydantic
