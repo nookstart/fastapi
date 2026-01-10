@@ -5,3 +5,4 @@ requests
 vercel_blob==0.4.2
 typing==3.7.4.3
 pydantic
+dotenv
