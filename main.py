@@ -36,7 +36,7 @@ async def create_processing_job(request: ProcessRequest, background_tasks: Backg
     try:
         # Gamitin ang BackgroundTasks para agad na mag-return ng response
         # habang tumatakbo ang mabigat na trabaho sa background.
-        background_tasks.add_task(process_pdf_from_url, request.pdf_url, request.issue_name)
+        background_tasks.add_task(process_pdf_from_url, request.pdf_file_id, request.issue_name)
         
         print(f"Accepted job for issue: {request.issue_name}. Processing in background.")
         

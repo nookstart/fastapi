@@ -1,29 +1,55 @@
 import fitz  # PyMuPDF
-import requests
 import json
 from vercel_blob import put
 from typing import Dict, Any
+import os
+import io
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+def get_drive_service():
+    """Creates an authenticated Google Drive service object."""
+    creds = service_account.Credentials.from_service_account_info(
+        {
+            "type": "service_account",
+            "private_key": os.getenv("GOOGLE_PRIVATE_KEY").replace('\\n', '\n'),
+            "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL") # Opsyonal
+        },
+        scopes=['https://www.googleapis.com/auth/drive.readonly'] # Read-only lang ang kailangan
+    )
+    service = build('drive', 'v3', credentials=creds)
+    return service
 
 # Itakda ang VERCEL_BLOB_STORE_ID mula sa environment variables
 # Kakailanganin mo itong i-set sa Railway.
 # os.environ['BLOB_STORE_ID'] = 'iyong_vercel_blob_store_id' 
 # os.environ['BLOB_TOKEN'] = 'iyong_vercel_blob_read_write_token'
 
-def process_pdf_from_url(pdf_url: str, issue_name: str) -> Dict[str, Any]:
+def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
     """
     Downloads a PDF, renders pages to PNG, extracts hotspots, and uploads to Vercel Blob.
     """
     print(f"Processing PDF for issue: {issue_name}")
 
-    # 1. I-download ang PDF
-    print(f"Downloading PDF from: {pdf_url}")
-    response = requests.get(pdf_url)
-    response.raise_for_status()  # Mag-throw ng error kung hindi 200 OK
-    pdf_bytes = response.content
+    drive_service = get_drive_service()
+    request = drive_service.files().get_media(fileId=file_id)
 
-    # 2. Buksan ang PDF gamit ang PyMuPDF
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # Gumamit ng in-memory buffer para i-download ang file
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while done is False:
+        status, done = downloader.next_chunk()
+        print(f"  > Download {int(status.progress() * 100)}%.")
     
+    pdf_bytes = fh.getvalue()
+    print("  > PDF downloaded successfully.")
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     hotspots = {
         "links": [],
         "emails": [],
@@ -68,7 +94,7 @@ def process_pdf_from_url(pdf_url: str, issue_name: str) -> Dict[str, Any]:
         "metadata": {
             "issue_name": issue_name,
             "total_pages": len(doc),
-            "pdf_source_url": pdf_url
+            "pdf_file_id": file_id
         },
         "hotspots": hotspots,
         "pages": image_urls # Isama ang listahan ng mga na-upload na images
