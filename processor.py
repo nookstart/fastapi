@@ -79,7 +79,9 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
         blob_image = put(
             f"magazine-pages/{issue_name}/{image_filename}",
             img_bytes,
-            {'access': 'public', 'add_random_suffix': False, 'allow_overwrite': True}
+            access='public',
+            add_random_suffix=False,
+            allow_overwrite=True
         )
         image_urls.append({"page_number": page_num, "url": blob_image['url']})
         print(f"  > Uploaded image to: {blob_image['url']}")
@@ -110,7 +112,9 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
     blob_manifest = put(
         f"magazine-pages/{issue_name}/manifest.json",
         manifest_str,
-        {'access': 'public', 'add_random_suffix': False, 'allow_overwrite': True}
+        access='public',
+        add_random_suffix=False,
+        allow_overwrite=True
     )
     print(f"Uploaded manifest to: {blob_manifest['url']}")
 
