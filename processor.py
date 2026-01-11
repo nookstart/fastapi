@@ -79,7 +79,6 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
         blob_image = put(
             f"magazine-pages/{issue_name}/{image_filename}",
             img_bytes,
-            access='public',
             add_random_suffix=False,
             allow_overwrite=True
         )
@@ -111,8 +110,7 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
     manifest_str = json.dumps(manifest, indent=2)
     blob_manifest = put(
         f"magazine-pages/{issue_name}/manifest.json",
-        manifest_str,
-        access='public',
+        manifest_str.encode('utf-8'),
         add_random_suffix=False,
         allow_overwrite=True
     )
