@@ -40,7 +40,7 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
     Downloads a PDF, renders pages to PNG, extracts hotspots, and uploads to Vercel Blob.
     """
     print(f"Processing PDF for issue: {issue_name}")
-
+    blob_token = os.getenv('BLOB_READ_WRITE_TOKEN')
     drive_service = get_drive_service()
     request = drive_service.files().get_media(fileId=file_id)
 
@@ -79,8 +79,8 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
         blob_image = put(
             f"magazine-pages/{issue_name}/{image_filename}",
             img_bytes,
-            add_random_suffix=False,
-            allow_overwrite=True
+            access='public',
+            token=blob_token
         )
         image_urls.append({"page_number": page_num, "url": blob_image['url']})
         print(f"  > Uploaded image to: {blob_image['url']}")
@@ -111,8 +111,8 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
     blob_manifest = put(
         f"magazine-pages/{issue_name}/manifest.json",
         manifest_str.encode('utf-8'),
-        add_random_suffix=False,
-        allow_overwrite=True
+        access='public',
+        token=blob_token
     )
     print(f"Uploaded manifest to: {blob_manifest['url']}")
 
