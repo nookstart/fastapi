@@ -9,6 +9,12 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 def get_drive_service():
+    client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
+    private_key = os.getenv("GOOGLE_PRIVATE_KEY")
+
+    if not client_email or not private_key:
+        raise ValueError("GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY environment variables must be set.")
+
     """Creates an authenticated Google Drive service object."""
     creds = service_account.Credentials.from_service_account_info(
         {
@@ -17,8 +23,7 @@ def get_drive_service():
             "client_email": os.getenv("GOOGLE_CLIENT_EMAIL"),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
-            "client_x509_cert_url": os.getenv("GOOGLE_CLIENT_X509_CERT_URL") # Opsyonal
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs"
         },
         scopes=['https://www.googleapis.com/auth/drive.readonly'] # Read-only lang ang kailangan
     )

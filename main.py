@@ -17,12 +17,8 @@ class ProcessRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     # Tiyakin na ang Vercel Blob environment variables ay naka-set
-    if not os.getenv('BLOB_STORE_ID') or not os.getenv('BLOB_TOKEN'):
-        raise RuntimeError("BLOB_STORE_ID and BLOB_TOKEN must be set in environment variables.")
-    
-    # Itakda ang mga ito para magamit ng `vercel-blob` library
-    os.environ['VERCEL_BLOB_STORE_ID'] = os.environ['BLOB_STORE_ID']
-    os.environ['VERCEL_BLOB_TOKEN'] = os.environ['BLOB_TOKEN']
+    if not os.getenv('BLOB_STORE_ID') or not os.getenv('BLOB_READ_WRITE_TOKEN'):
+        raise RuntimeError("BLOB_STORE_ID and BLOB_READ_WRITE_TOKEN must be set in environment variables.")
 
 @app.get("/")
 async def root():
