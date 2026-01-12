@@ -1,12 +1,14 @@
 import fitz  # PyMuPDF
 import json
 from vercel_blob import put
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 import io
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from supabase import create_client, Client
+from slugify import slugify
 
 def get_drive_service():
     client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -30,12 +32,74 @@ def get_drive_service():
     service = build('drive', 'v3', credentials=creds)
     return service
 
+def save_to_database(
+    issue_name: str, 
+    publication_date: str, 
+    manifest_url: str, 
+    pages_data: List[Dict[str, Any]],
+    toc_data: List[Dict[str, Any]]
+):
+    """Saves the processed magazine issue and pages to the Supabase database."""
+    print("  > Saving data to Supabase...")
+    
+    try:
+        # I-initialize ang Supabase client
+        url: str = os.environ.get("SUPABASE_URL")
+        key: str = os.environ.get("SUPABASE_SERVICE_KEY")
+        supabase: Client = create_client(url, key)
+
+        # 1. Gumamit ng 'upsert' para sa magazine_issues
+        issue_slug = slugify(issue_name)
+        issue_to_upsert = {
+            "issue_slug": issue_slug,
+            "issue_number": issue_name,
+            "publication_date": publication_date,
+            "status": "published",
+            "manifest_url": manifest_url,
+        }
+        
+        issue_response = supabase.table("magazine_issues").upsert(
+            issue_to_upsert, on_conflict="issue_slug"
+        ).execute()
+        
+        # Kunin ang ID ng na-upsert na issue
+        issue_id = issue_response.data[0]['id']
+        print(f"  > Upserted issue with ID: {issue_id}")
+
+        # 2. Ihanda ang records para sa magazine_pages
+        pages_to_upsert = []
+        for page in pages_data:
+            page_num = page['page_number']
+            # Hanapin ang katumbas na TOC entry para sa page number na ito
+            toc_entry = next((item for item in toc_data if item['page'] == page_num), None)
+            
+            pages_to_upsert.append({
+                "issue_id": issue_id,
+                "page_number": page_num,
+                "background_image_url": page['url'],
+                "section": toc_entry['section'] if toc_entry else None,
+                "title": toc_entry['title'] if toc_entry else None,
+            })
+
+        # 3. Gumamit ng 'upsert' para sa magazine_pages
+        # Tiyakin na may composite unique key ka sa (issue_id, page_number) sa iyong Supabase table
+        pages_response = supabase.table("magazine_pages").upsert(
+            pages_to_upsert, on_conflict="issue_id, page_number"
+        ).execute()
+
+        print(f"  > Upserted {len(pages_response.data)} pages.")
+        return {"db_status": "success"}
+
+    except Exception as e:
+        print(f"  > DATABASE ERROR: {e}")
+        # Mag-throw ng error para malaman ng Vercel Cron na nag-fail ito
+        raise
 # Itakda ang VERCEL_BLOB_STORE_ID mula sa environment variables
 # Kakailanganin mo itong i-set sa Railway.
 # os.environ['BLOB_STORE_ID'] = 'iyong_vercel_blob_store_id' 
 # os.environ['BLOB_TOKEN'] = 'iyong_vercel_blob_read_write_token'
 
-def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
+def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, toc_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Downloads a PDF, renders pages to PNG, extracts hotspots, and uploads to Vercel Blob.
     """
@@ -112,5 +176,11 @@ def process_pdf_from_url(file_id: str, issue_name: str) -> Dict[str, Any]:
         options={"allowOverwrite": True, "access": 'public'}
     )
     print(f"Uploaded manifest to: {blob_manifest['url']}")
-
+    save_to_database(
+        issue_name=issue_name,
+        publication_date=publication_date,
+        manifest_url=blob_manifest['url'],
+        pages_data=image_urls,
+        toc_data=toc_data
+    )
     return {"status": "success", "manifest_url": blob_manifest['url'], "page_count": len(doc)}
