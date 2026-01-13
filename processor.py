@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from supabase import create_client, Client
 from slugify import slugify
-
+import re
 def get_drive_service():
     client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
     private_key = os.getenv("GOOGLE_PRIVATE_KEY")
@@ -47,7 +47,8 @@ def save_to_database(
         url: str = os.environ.get("SUPABASE_URL")
         key: str = os.environ.get("SUPABASE_SERVICE_KEY")
         supabase: Client = create_client(url, key)
-
+        cover_page_entry = next((page for page in pages_data if page['page_number'] == 1), None)
+        cover_url = cover_page_entry['url'] if cover_page_entry else None
         # 1. Gumamit ng 'upsert' para sa magazine_issues
         issue_slug = slugify(issue_name)
         issue_to_upsert = {
@@ -56,6 +57,7 @@ def save_to_database(
             "publication_date": publication_date,
             "status": "published",
             "manifest_url": manifest_url,
+            "cover_image_url": cover_url,
         }
         
         issue_response = supabase.table("magazine_issues").upsert(
@@ -125,6 +127,12 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         "urls": []
     }
     
+    # ✨ I-DEFINE ANG MGA REGEX PATTERNS DITO ✨
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    phone_pattern = r'\b(?:\+?(\d{1,3}))?[-. (]*(\d{3})[-. )]*(\d{3})[-. ]*(\d{4})\b'
+    # Mas simpleng URL pattern para sa text
+    url_pattern = r'\b(?:https?://|www\.)(?:[-\w.]|(?:%[\da-fA-F]{2}))+\b'
+
     image_urls = []
 
     # 3. I-proseso ang bawat page
@@ -156,7 +164,25 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
                     "url": link.get('uri'),
                     "bbox": list(link.get('from')) # Ang 'from' ay ang Rect object
                 })
+        # --- C. ✨ I-EXTRACT ANG TEXT AT I-SCAN GAMIT ANG REGEX ✨ ---
+        # Gamitin ang "dict" para makuha ang text kasama ang bounding box
+        text_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES)["blocks"]
+        for block in text_blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text = span["text"]
+                        bbox = list(span["bbox"]) # Kunin ang bbox ng text span
 
+                        # Hanapin ang emails, phones, at URLs sa text na ito
+                        for match in re.finditer(email_pattern, text):
+                            hotspots["emails"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
+                        
+                        for match in re.finditer(phone_pattern, text):
+                            hotspots["phones"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
+
+                        for match in re.finditer(url_pattern, text):
+                            hotspots["urls"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
     # 4. I-assemble ang manifest/hotspots JSON
     manifest = {
         "metadata": {
