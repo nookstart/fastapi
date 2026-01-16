@@ -33,12 +33,14 @@ def get_drive_service():
     return service
 
 def save_to_database(
-    issue_name: str, 
-    publication_date: str, 
-    manifest_url: str, 
-    pages_data: List[Dict[str, Any]],
-    toc_data: List[Dict[str, Any]]
-):
+        issue_name: str, 
+        publication_date: str, 
+        manifest_url: str, 
+        cover_image_url: str,
+        page_dimensions: Dict[str, int], # <-- Bagong parameter
+        pages_data: List[Dict[str, Any]],
+        toc_data: List[Dict[str, Any]]
+    ):
     """Saves the processed magazine issue and pages to the Supabase database."""
     print("  > Saving data to Supabase...")
     
@@ -47,22 +49,17 @@ def save_to_database(
         url: str = os.environ.get("SUPABASE_URL")
         key: str = os.environ.get("SUPABASE_SERVICE_KEY")
         supabase: Client = create_client(url, key)
-        cover_page_entry = next((page for page in pages_data if page['page_number'] == 1), None)
-        cover_url = cover_page_entry['url'] if cover_page_entry else None
         # 1. Gumamit ng 'upsert' para sa magazine_issues
         issue_slug = slugify(issue_name)
-        issue_to_upsert = {
+        issue_response = supabase.table("magazine_issues").upsert({
             "issue_slug": issue_slug,
             "issue_number": issue_name,
             "publication_date": publication_date,
             "status": "published",
             "manifest_url": manifest_url,
-            "cover_image_url": cover_url,
-        }
-        
-        issue_response = supabase.table("magazine_issues").upsert(
-            issue_to_upsert, on_conflict="issue_slug"
-        ).execute()
+            "cover_image_url": cover_image_url,
+            "page_dimensions": page_dimensions # <-- I-save ang dimensions
+        }, on_conflict="issue_slug").execute()
         
         # Kunin ang ID ng na-upsert na issue
         issue_id = issue_response.data[0]['id']
@@ -140,10 +137,31 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         page_num = i + 1
         print(f"Processing Page {page_num}/{len(doc)}...")
 
+        content_box = None
+        try:
+            # 1. Subukan nating kunin ang text bounding box.
+            text_bbox_tuple = page.get_text("bbox")
+            # 2. Subukan nating gumawa ng Rect object mula dito.
+            content_box = fitz.Rect(text_bbox_tuple)
+            
+            # 3. Kung ang resulta ay empty o infinite, ituring itong invalid.
+            if content_box.is_empty or content_box.is_infinite:
+                content_box = None # I-reset sa None para gamitin ang fallback
+
+        except ValueError:
+            # Kung mag-fail ang fitz.Rect() (dahil sa "not enough values to unpack"),
+            # ibig sabihin, walang valid na text bbox.
+            print(f"  > Could not determine text bbox for page {page_num}. Using full page.")
+            content_box = None # Siguraduhing None ito
+
+        # 4. Fallback: Kung wala pa ring valid na content_box, gamitin ang buong page.
+        if content_box is None:
+            content_box = page.rect
+
         # --- A. I-render ang page sa PNG ---
-        pix = page.get_pixmap(dpi=150)  # Mag-adjust ng DPI para sa quality vs. file size
+        pix = page.get_pixmap(dpi=150, clip=content_box)
         img_bytes = pix.tobytes("png")
-        
+
         # I-upload ang image sa Vercel Blob
         # Gumamit ng one-based, zero-padded na pangalan
         image_filename = f"page-{page_num:02d}.png"
@@ -152,7 +170,13 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
             img_bytes,
             options={"allowOverwrite": True, "access": 'public'}
         )
-        image_urls.append({"page_number": page_num, "url": blob_image['url']})
+        image_urls.append({
+            "page_number": page_num, 
+            "url": blob_image['url'],
+            # ✨ IDAGDAG ANG BAGONG DIMENSIONS ✨
+            "width": pix.width,
+            "height": pix.height
+        })
         print(f"  > Uploaded image to: {blob_image['url']}")
 
         # --- B. I-extract ang mga links (hotspots) ---
@@ -193,7 +217,7 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         "hotspots": hotspots,
         "pages": image_urls # Isama ang listahan ng mga na-upload na images
     }
-    
+
     # 5. I-upload ang manifest.json sa Vercel Blob
     manifest_str = json.dumps(manifest, indent=2)
     blob_manifest = put(
@@ -202,10 +226,17 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         options={"allowOverwrite": True, "access": 'public'}
     )
     print(f"Uploaded manifest to: {blob_manifest['url']}")
+    first_page_dims = {
+        "width": image_urls[0]['width'] if image_urls else 612,
+        "height": image_urls[0]['height'] if image_urls else 792,
+    }
     save_to_database(
         issue_name=issue_name,
         publication_date=publication_date,
         manifest_url=blob_manifest['url'],
+        cover_image_url=image_urls[0]['url'] if image_urls else None,
+        # Ipasa ang bagong dimensions
+        page_dimensions=first_page_dims, 
         pages_data=image_urls,
         toc_data=toc_data
     )
