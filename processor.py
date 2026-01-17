@@ -137,26 +137,19 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         page_num = i + 1
         print(f"Processing Page {page_num}/{len(doc)}...")
 
-        content_box = None
-        try:
-            # 1. Subukan nating kunin ang text bounding box.
-            text_bbox_tuple = page.get_text("bbox")
-            # 2. Subukan nating gumawa ng Rect object mula dito.
-            content_box = fitz.Rect(text_bbox_tuple)
-            
-            # 3. Kung ang resulta ay empty o infinite, ituring itong invalid.
-            if content_box.is_empty or content_box.is_infinite:
-                content_box = None # I-reset sa None para gamitin ang fallback
+        full_rect = page.rect
 
-        except ValueError:
-            # Kung mag-fail ang fitz.Rect() (dahil sa "not enough values to unpack"),
-            # ibig sabihin, walang valid na text bbox.
-            print(f"  > Could not determine text bbox for page {page_num}. Using full page.")
-            content_box = None # Siguraduhing None ito
+        # 2. I-calculate ang 2% margin sa bawat gilid
+        margin_x = full_rect.width * 0.02
+        margin_y = full_rect.height * 0.02
 
-        # 4. Fallback: Kung wala pa ring valid na content_box, gamitin ang buong page.
-        if content_box is None:
-            content_box = page.rect
+        # 3. Gumawa ng bagong Rect na mas maliit ng 2% sa bawat gilid
+        content_box = fitz.Rect(
+            full_rect.x0 + margin_x,
+            full_rect.y0 + margin_y,
+            full_rect.x1 - margin_x,
+            full_rect.y1 - margin_y
+        )
 
         # --- A. I-render ang page sa PNG ---
         pix = page.get_pixmap(dpi=150, clip=content_box)
@@ -201,7 +194,7 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
                         # Hanapin ang emails, phones, at URLs sa text na ito
                         for match in re.finditer(email_pattern, text):
                             hotspots["emails"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
-                        
+
                         for match in re.finditer(phone_pattern, text):
                             hotspots["phones"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
 
