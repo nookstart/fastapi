@@ -3,6 +3,7 @@ hypercorn==0.14.4
 PyMuPDF==1.24.1
 vercel_blob==0.4.2
 typing==3.7.4.3
+Pillow==11.1.0
 pydantic
 dotenv
 google-api-python-client

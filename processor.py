@@ -10,6 +10,9 @@ from googleapiclient.http import MediaIoBaseDownload
 from supabase import create_client, Client
 from slugify import slugify
 import re
+from PIL import Image, ImageChops
+import io
+
 def get_drive_service():
     client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
     private_key = os.getenv("GOOGLE_PRIVATE_KEY")
@@ -98,6 +101,43 @@ def save_to_database(
 # os.environ['BLOB_STORE_ID'] = 'iyong_vercel_blob_store_id' 
 # os.environ['BLOB_TOKEN'] = 'iyong_vercel_blob_read_write_token'
 
+def autocrop_image(image_bytes: bytes) -> bytes:
+    """
+    Tatanggap ng image bytes, aalisin ang mga puting borders,
+    at ibabalik ang na-crop na image bytes.
+    """
+    # I-load ang image mula sa bytes
+    image = Image.open(io.BytesIO(image_bytes))
+    
+    # I-convert sa grayscale para mas madali ang analysis
+    # (Hindi kailangan kung sigurado kang laging puti ang background)
+    # bg = Image.new(image.mode, image.size, image.getpixel((0,0)))
+    # diff = ImageChops.difference(image, bg)
+    # diff = ImageChops.add(diff, diff, 2.0, -100)
+    # bbox = diff.getbbox()
+
+    # Isang mas simpleng approach: i-convert sa 'L' (grayscale) at kunin ang bbox
+    grayscale_image = image.convert('L')
+    
+    # I-invert ang image para ang content ay maging puti at ang background ay itim
+    inverted_image = ImageChops.invert(grayscale_image)
+    
+    # Kunin ang bounding box ng non-black (original content) pixels
+    bbox = inverted_image.getbbox()
+    
+    if bbox:
+        # I-crop ang original (colored) na image gamit ang nahanap na bbox
+        cropped_image = image.crop(bbox)
+        
+        # I-save ang na-crop na image pabalik sa isang in-memory bytes buffer
+        buffer = io.BytesIO()
+        cropped_image.save(buffer, format='PNG')
+        return buffer.getvalue()
+    else:
+        # Kung walang nahanap na content (e.g., isang blangkong page),
+        # ibalik na lang ang original na image bytes
+        return image_bytes
+
 def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, toc_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Downloads a PDF, renders pages to PNG, extracts hotspots, and uploads to Vercel Blob.
@@ -137,38 +177,35 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         page_num = i + 1
         print(f"Processing Page {page_num}/{len(doc)}...")
 
-        full_rect = page.rect
-
-        # 2. I-calculate ang 2% margin sa bawat gilid
-        margin_x = full_rect.width * 0.02
-        margin_y = full_rect.height * 0.02
-
-        # 3. Gumawa ng bagong Rect na mas maliit ng 2% sa bawat gilid
-        content_box = fitz.Rect(
-            full_rect.x0 + margin_x,
-            full_rect.y0 + margin_y,
-            full_rect.x1 - margin_x,
-            full_rect.y1 - margin_y
-        )
-
         # --- A. I-render ang page sa PNG ---
-        pix = page.get_pixmap(dpi=150, clip=content_box)
+        pix = page.get_pixmap(dpi=150)
         img_bytes = pix.tobytes("png")
 
-        # I-upload ang image sa Vercel Blob
-        # Gumamit ng one-based, zero-padded na pangalan
+        # 2. ✨ I-AUTOCROP ANG IMAGE GAMIT ANG PILLOW ✨
+        try:
+            cropped_img_bytes = autocrop_image(img_bytes)
+            print(f"  > Autocropped image. Original: {len(img_bytes)} bytes, Cropped: {len(cropped_img_bytes)} bytes")
+        except Exception as e:
+            print(f"  > Warning: Autocrop failed for page {page_num}. Using original image. Error: {e}")
+            cropped_img_bytes = img_bytes
+
+        # 3. I-upload ang na-crop na image bytes
         image_filename = f"page-{page_num:02d}.png"
         blob_image = put(
             f"magazine-pages/{issue_name}/{image_filename}",
-            img_bytes,
-            options={"allowOverwrite": True, "access": 'public'}
+            cropped_img_bytes, # <-- Gamitin ang na-crop na bytes
+            options={'token': os.environ['BLOB_READ_WRITE_TOKEN'], "allowOverwrite": True, "access": 'public'}
         )
+        
+        # Para makuha ang bagong dimensions, kailangan nating i-load ulit ang na-crop na image
+        final_image = Image.open(io.BytesIO(cropped_img_bytes))
+
         image_urls.append({
             "page_number": page_num, 
             "url": blob_image['url'],
             # ✨ IDAGDAG ANG BAGONG DIMENSIONS ✨
-            "width": pix.width,
-            "height": pix.height
+            "width": final_image.width,
+            "height": final_image.height
         })
         print(f"  > Uploaded image to: {blob_image['url']}")
 
