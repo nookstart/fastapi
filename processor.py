@@ -81,6 +81,9 @@ def save_to_database(
                 "background_image_url": page['url'],
                 "section": toc_entry['section'] if toc_entry else None,
                 "title": toc_entry['title'] if toc_entry else None,
+                "crop_box": page['crop_box'],
+                "width": page['width'],
+                "height": page['height'],
             })
 
         # 3. Gumamit ng 'upsert' para sa magazine_pages
@@ -176,18 +179,37 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
     for i, page in enumerate(doc):
         page_num = i + 1
         print(f"Processing Page {page_num}/{len(doc)}...")
-
-        # --- A. I-render ang page sa PNG ---
-        pix = page.get_pixmap(dpi=150)
+        # --- ✨ HAKBANG 1: I-RENDER ANG BUONG PAGE ✨ ---
+        dpi = 150
+        pix = page.get_pixmap(dpi=dpi)
         img_bytes = pix.tobytes("png")
 
-        # 2. ✨ I-AUTOCROP ANG IMAGE GAMIT ANG PILLOW ✨
-        try:
-            cropped_img_bytes = autocrop_image(img_bytes)
+        # --- ✨ HAKBANG 2: I-CALCULATE ANG CROP BOX GAMIT ANG PILLOW ✨ ---
+        image = Image.open(io.BytesIO(img_bytes))
+        grayscale_image = image.convert('L')
+        inverted_image = ImageChops.invert(grayscale_image)
+        # Ang bbox na ito ay nasa PIXEL coordinates
+        autocrop_pixel_bbox = inverted_image.getbbox()
+
+        if autocrop_pixel_bbox:
+            # I-crop ang imahe
+            cropped_image = image.crop(autocrop_pixel_bbox)
+            buffer = io.BytesIO()
+            cropped_image.save(buffer, format='PNG')
+            cropped_img_bytes = buffer.getvalue()
+            
+            # ✨ I-CONVERT ANG PIXEL BBOX PABALIK SA PDF POINTS ✨
+            # Ang scale factor ay dpi / 72 (standard PDF points per inch)
+            scale = dpi / 72.0
+            x0, y0, x1, y1 = autocrop_pixel_bbox
+            final_content_box = fitz.Rect(x0 / scale, y0 / scale, x1 / scale, y1 / scale)
+            
             print(f"  > Autocropped image. Original: {len(img_bytes)} bytes, Cropped: {len(cropped_img_bytes)} bytes")
-        except Exception as e:
-            print(f"  > Warning: Autocrop failed for page {page_num}. Using original image. Error: {e}")
+        else:
+            # Kung walang nahanap na content, gamitin ang original
             cropped_img_bytes = img_bytes
+            final_content_box = page.rect
+            print(f"  > Warning: Autocrop failed for page {page_num}. Using full page.")
 
         # 3. I-upload ang na-crop na image bytes
         image_filename = f"page-{page_num:02d}.png"
@@ -196,7 +218,6 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
             cropped_img_bytes, # <-- Gamitin ang na-crop na bytes
             options={'token': os.environ['BLOB_READ_WRITE_TOKEN'], "allowOverwrite": True, "access": 'public'}
         )
-        
         # Para makuha ang bagong dimensions, kailangan nating i-load ulit ang na-crop na image
         final_image = Image.open(io.BytesIO(cropped_img_bytes))
 
@@ -205,10 +226,15 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
             "url": blob_image['url'],
             # ✨ IDAGDAG ANG BAGONG DIMENSIONS ✨
             "width": final_image.width,
-            "height": final_image.height
+            "height": final_image.height,
+            "crop_box": {
+                "x0": final_content_box.x0, 
+                "y0": final_content_box.y0, 
+                "x1": final_content_box.x1, 
+                "y1": final_content_box.y1
+            }
         })
         print(f"  > Uploaded image to: {blob_image['url']}")
-
         # --- B. I-extract ang mga links (hotspots) ---
         links = page.get_links()
         for link in links:
@@ -219,24 +245,47 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
                     "bbox": list(link.get('from')) # Ang 'from' ay ang Rect object
                 })
         # --- C. ✨ I-EXTRACT ANG TEXT AT I-SCAN GAMIT ANG REGEX ✨ ---
-        # Gamitin ang "dict" para makuha ang text kasama ang bounding box
+        
+        # --- ✨ HAKBANG 4: I-adjust ang hotspot bbox gamit ang Master Content Box ✨ ---
+
+        # Kunin ang top-left offset ng page's cropbox
+        print(f"    [DEBUG] Page {page_num}: Starting HYBRID hotspot extraction...")
+
+        # I-iterate ang lahat ng text blocks
         text_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES)["blocks"]
         for block in text_blocks:
             if "lines" in block:
                 for line in block["lines"]:
                     for span in line["spans"]:
                         text = span["text"]
-                        bbox = list(span["bbox"]) # Kunin ang bbox ng text span
+                        span_bbox = fitz.Rect(span["bbox"]) # Bbox ng buong span
 
-                        # Hanapin ang emails, phones, at URLs sa text na ito
+                        # 1. Hanapin ang emails sa loob ng text ng span
                         for match in re.finditer(email_pattern, text):
-                            hotspots["emails"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
+                            # Ngayon, hanapin ang eksaktong BBOX ng match na iyon
+                            # sa loob lang ng span's bounding box.
+                            match_rects = page.search_for(match.group(0), clip=span_bbox, quads=False)
+                            if match_rects:
+                                # Kunin ang unang match (kadalasang isa lang naman ito)
+                                rect = match_rects[0]
+                                print(f"      [DEBUG] Found Email: '{match.group(0)}' at {list(rect)}")
+                                hotspots["emails"].append({"page": page_num, "value": match.group(0), "bbox": list(rect)})
 
+                        # 2. Gawin din para sa phones
                         for match in re.finditer(phone_pattern, text):
-                            hotspots["phones"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
+                            match_rects = page.search_for(match.group(0), clip=span_bbox, quads=False)
+                            if match_rects:
+                                rect = match_rects[0]
+                                print(f"      [DEBUG] Found Phone: '{match.group(0)}' at {list(rect)}")
+                                hotspots["phones"].append({"page": page_num, "value": match.group(0), "bbox": list(rect)})
 
+                        # 3. Gawin din para sa URLs
                         for match in re.finditer(url_pattern, text):
-                            hotspots["urls"].append({"page": page_num, "value": match.group(0), "bbox": bbox})
+                            match_rects = page.search_for(match.group(0), clip=span_bbox, quads=False)
+                            if match_rects:
+                                rect = match_rects[0]
+                                print(f"      [DEBUG] Found URL: '{match.group(0)}' at {list(rect)}")
+                                hotspots["urls"].append({"page": page_num, "value": match.group(0), "bbox": list(rect)})
     # 4. I-assemble ang manifest/hotspots JSON
     manifest = {
         "metadata": {
@@ -256,9 +305,10 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         options={"allowOverwrite": True, "access": 'public'}
     )
     print(f"Uploaded manifest to: {blob_manifest['url']}")
-    first_page_dims = {
-        "width": image_urls[0]['width'] if image_urls else 612,
-        "height": image_urls[0]['height'] if image_urls else 792,
+    first_page_for_dims = doc[0]
+    original_pdf_dimensions = {
+        "width": first_page_for_dims.rect.width,
+        "height": first_page_for_dims.rect.height
     }
     save_to_database(
         issue_name=issue_name,
@@ -266,8 +316,9 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         manifest_url=blob_manifest['url'],
         cover_image_url=image_urls[0]['url'] if image_urls else None,
         # Ipasa ang bagong dimensions
-        page_dimensions=first_page_dims, 
+        page_dimensions=original_pdf_dimensions, 
         pages_data=image_urls,
         toc_data=toc_data
     )
+    print(f"  First page dim: ")
     return {"status": "success", "manifest_url": blob_manifest['url'], "page_count": len(doc)}
