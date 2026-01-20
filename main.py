@@ -1,32 +1,16 @@
 import os
 from fastapi import FastAPI, HTTPException, BackgroundTasks
-from pydantic import BaseModel
 from dotenv import load_dotenv
 from processor import process_pdf_from_url
-from typing import Dict, Any, List
 
 from processor import process_pdf_from_url
 from reflow_processor import process_pdf_for_reflow
+from models import ProcessRequest, ReflowRequest
 
 # I-load ang environment variables mula sa .env file (para sa local dev)
 load_dotenv()
 
 app = FastAPI()
-
-class ReflowConfig(BaseModel):
-    issue_number: str
-    publication_date: str
-    table_of_contents: List[Dict[str, Any]]
-
-# Ito ang magiging main request body para sa /reflow-pdf
-class ReflowRequest(BaseModel):
-    pdf_file_id: str
-    config: ReflowConfig
-
-# I-define ang structure ng config na inaasahan
-class ProcessRequest(BaseModel):
-    pdf_file_id: str
-    config: Dict[str, Any] # Tumanggap ng isang generic na dictionary
 
 @app.on_event("startup")
 async def startup_event():
