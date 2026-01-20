@@ -249,7 +249,7 @@ def process_pdf_from_url(file_id: str, issue_name: str, publication_date: str, t
         # --- ✨ HAKBANG 4: I-adjust ang hotspot bbox gamit ang Master Content Box ✨ ---
 
         # Kunin ang top-left offset ng page's cropbox
-        print(f"    [DEBUG] Page {page_num}: Starting HYBRID hotspot extraction...")
+        # print(f"    [DEBUG] Page {page_num}: Starting HYBRID hotspot extraction...")
 
         # I-iterate ang lahat ng text blocks
         text_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_LIGATURES)["blocks"]
