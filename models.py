@@ -14,7 +14,5 @@ class ReflowRequest(BaseModel):
 
 # --- Model para sa Original Image-based Process ---
 class ProcessRequest(BaseModel):
-    file_id: str
-    issue_name: str
-    publication_date: str
-    toc_data: list
+    pdf_file_id: str
+    config: ReflowConfig

@@ -11,89 +11,137 @@ from slugify import slugify
 from processor import get_drive_service, save_to_database # Gagamitin natin ang save_to_database mamaya
 from models import ReflowConfig
 
+# --- ✨ BAGONG ROBUST SUPABASE CLIENT GETTER ✨ ---
+_supabase_client = None
 
-# --- SUPABASE SETUP ---
-# Kunin ang Supabase credentials mula sa environment variables
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+def get_supabase_client() -> Client:
+    """
+    Initializes and returns a singleton Supabase client.
+    Raises an exception if credentials are not set.
+    """
+    global _supabase_client
+    if _supabase_client is None:
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
 
-# Gumawa ng isang global Supabase client
-# Mas efficient ito kaysa gumawa ng client sa bawat request
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+        if not supabase_url or not supabase_key:
+            raise ValueError("Supabase URL and Key must be set in environment variables.")
+        
+        # Siguraduhin na may trailing slash
+        if not supabase_url.endswith('/'):
+            supabase_url += '/'
+            
+        print("Initializing Supabase client...")
+        _supabase_client = create_client(supabase_url, supabase_key)
+    
+    return _supabase_client
 
 def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: bytes, content_type: str):
     """Helper function para mag-upload ng file sa Supabase Storage."""
-    if not supabase:
-        print("  - WARNING: Supabase client not initialized. Skipping upload.")
-        return None
     try:
-        # Ang `upload` ay mag-o-overwrite by default kung may existing file
+        supabase = get_supabase_client() # <-- Gamitin ang bagong function
         supabase.storage.from_(bucket_name).upload(
             file=file_body,
             path=file_path,
             file_options={"content-type": content_type, "cache-control": "3600", "upsert": "true"}
         )
-        # Kunin ang public URL
         public_url = supabase.storage.from_(bucket_name).get_public_url(file_path)
         print(f"  - ✅ Uploaded to Supabase: {public_url}")
         return public_url
     except Exception as e:
-        print(f"  - ❌ Supabase upload failed for {file_path}. Error: {e}")
+        # Mag-print ng mas detalyadong error
+        print(f"  - ❌ Supabase upload failed for {file_path}. Error Type: {type(e).__name__}, Details: {e}")
         return None
 
 def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_name: str, page_number: int) -> List[Dict[str, Any]]:
     """
-    Analyzes a single page, extracts content, and SMART CROPS images before uploading.
+    Analyzes a single page for granular content elements (spans),
+    flags potential shadow text, and smart-crops images.
     """
-    # --- Step 1 & 2: Text extraction at font size calculation (walang pagbabago) ---
-    text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
-    font_sizes = [round(s['size']) for b in text_dict.get("blocks", []) if b['type'] == 0 for l in b['lines'] for s in l['spans']]
-    most_common_size = Counter(font_sizes).most_common(1)[0][0] if font_sizes else 12
-
-    # --- Step 3: Combine text and images ---
-    elements = []
+    print("    - Starting granular extraction...")
     
-    # Process text blocks (walang pagbabago)
-    for block in text_dict.get("blocks", []):
-        if block['type'] == 0:
-            full_text = "".join(s['text'] for l in block['lines'] for s in l['spans'])
-            block_font_sizes = [round(s['size']) for l in block['lines'] for s in l['spans']]
-            avg_size = sum(block_font_sizes) / len(block_font_sizes) if block_font_sizes else 0
-            element_type = "heading" if avg_size > most_common_size * 1.5 else "paragraph"
-            
-            elements.append({
-                "type": element_type,
-                "text": full_text.strip(),
-                "bbox": block["bbox"],
-            })
-
-    # ✨ --- BAGONG LOGIC PARA SA "SMART CROPPING" NG IMAGES --- ✨
-    # Gamitin ang get_image_info para makuha ang 'bbox' ng bawat image sa page
+    # --- Step 1: Extract text blocks (dict) at image info ---
+    text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
     image_info_list = page.get_image_info(xrefs=True)
 
+    elements = []
+    
+    # --- Step 2: Process Text Spans (Granular) ---
+    # I-iterate ang bawat block, line, at span
+    for block_idx, block in enumerate(text_dict.get("blocks", [])):
+        if block['type'] != 0:  # 0 = text block
+            continue
+        
+        spans_in_block = []
+        for line_idx, line in enumerate(block.get("lines", [])):
+            for span_idx, span in enumerate(line.get("spans", [])):
+                # Linisin ang text, minsan may kasamang weird whitespace
+                span_text = span['text'].strip()
+                if not span_text:
+                    continue
+
+                # I-store ang lahat ng spans sa isang temporary list
+                spans_in_block.append({
+                    "id": f"p{page_number}_b{block_idx}_s{span_idx}",
+                    "block_id": f"p{page_number}_b{block_idx}",
+                    "type": "text",
+                    "bbox": span["bbox"],
+                    "content": span_text,
+                    "font_info": {
+                        "size": round(span["size"], 2),
+                        "font": span["font"],
+                        "color": span["color"],
+                    },
+                    "reflow_hints": {} # Placeholder para sa ating "intelligent" hula
+                })
+
+        # --- Step 3: Shadow Text Detection Logic (within the same block) ---
+        # Pagkatapos kolektahin lahat ng spans sa isang block, i-compare sila
+        final_spans_for_block = []
+        for i, current_span in enumerate(spans_in_block):
+            is_shadow = False
+            # I-compare ang current_span sa lahat ng iba pang spans sa block
+            for j, other_span in enumerate(spans_in_block):
+                if i == j:  # Huwag i-compare sa sarili niya
+                    continue
+
+                # Condition 1: Pareho ba ang text?
+                if current_span['content'] == other_span['content']:
+                    # Condition 2: Halos magkadikit ba ang position?
+                    # Check kung ang top-left corner nila ay napakaliit lang ang agwat
+                    dist_x = abs(current_span['bbox'][0] - other_span['bbox'][0])
+                    dist_y = abs(current_span['bbox'][1] - other_span['bbox'][1])
+                    
+                    # Kung ang agwat ay mas mababa sa 2 pixels, posibleng shadow ito
+                    if dist_x < 2 and dist_y < 2:
+                        # Condition 3: Alin ang nasa likod?
+                        # Ang span na unang na-render (mas mababang index sa original PDF structure)
+                        # ay malamang ang shadow.
+                        if j < i:
+                            is_shadow = True
+                            break # Found a shadow, no need to check further
+
+            current_span["reflow_hints"]["is_shadow_text"] = is_shadow
+            final_spans_for_block.append(current_span)
+        
+        # Idagdag ang na-filter na spans sa main elements list
+        elements.extend(final_spans_for_block)
+
+
+    # --- Step 4: Process Images (Smart Cropping - walang pagbabago) ---
     for img_info in image_info_list:
-        # Ang bbox ay ang actual na sukat at posisyon ng image sa page
         bbox = img_info['bbox']
         xref = img_info['xref']
-        
         if xref == 0: continue
 
-        # Gumawa ng Pixmap (isang rendered na imahe) ng page,
-        # pero i-CROP ito gamit ang eksaktong bbox ng imahe.
-        # Ang `clip=bbox` ang nagsasagawa ng cropping.
-        # Magdagdag tayo ng zoom (dpi=200) para sa mas mataas na kalidad.
-        zoom_matrix = fitz.Matrix(2, 2) # 2x zoom = 144 dpi
+        zoom_matrix = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=zoom_matrix, clip=bbox)
-        
-        # I-convert ang Pixmap sa bytes (PNG format para suportahan ang transparency)
         image_bytes = pix.tobytes("png")
         image_ext = "png"
 
-        # Gumawa ng unique na file path para sa Supabase
         image_filename = f"page_{page_number}_xref_{xref}_cropped.{image_ext}"
         supabase_path = f"{issue_name}/images/{image_filename}"
         
-        # I-upload ang na-CROP na image sa Supabase Storage
         public_url = upload_to_supabase_storage(
             bucket_name="magazine-pages",
             file_path=supabase_path,
@@ -103,32 +151,26 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
 
         if public_url:
             elements.append({
+                "id": f"p{page_number}_img_{xref}",
+                "block_id": None, # Ang mga imahe ay walang block sa text_dict
                 "type": "image",
+                "bbox": bbox,
                 "src": public_url,
-                "bbox": bbox, # Gamitin ang totoong bbox para sa sorting
+                "reflow_hints": {}
             })
 
-    # --- Step 4 & 5: Sort at Finalize (walang pagbabago) ---
+    # --- Step 5: Sort all elements by their vertical position (walang pagbabago) ---
     elements.sort(key=lambda el: el["bbox"][1])
-
-    final_content = []
-    for el in elements:
-        item = {"type": el["type"]}
-        if el["type"] == "image":
-            item["src"] = el["src"]
-        else:
-            item["text"] = el["text"]
-        final_content.append(item)
-            
-    return final_content
-
+    
+    print(f"    - Extracted {len(elements)} granular elements.")
+    
+    # Sa ngayon, i-return natin ang buong listahan. Ang pag-alis ng `bbox` ay gagawin na sa front-end.
+    return elements
 
 def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]:
     """
     Main function to process the PDF for reflow.
     """
-    if not supabase:
-        raise Exception("Supabase client is not initialized. Check environment variables.")
 
     issue_name = config.issue_number
     print(f"--- 🚀 REFLOW PROCESSOR INITIATED for: {issue_name} 🚀 ---")
@@ -181,15 +223,18 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
         # 5. I-UPDATE ANG DATABASE
         print("\n--- Updating 'magazine_issues' table in Supabase DB ---")
         try:
-            # Gamitin ang `upsert` para mag-insert ng bago o mag-update kung existing na
-            issue_slug = slugify(issue_name)
-            supabase.table("magazine_issues").upsert({
-                "issue_number": issue_name,
-                "issue_slug": issue_slug,
-                "publication_date": config.publication_date,
-                "reflow_content_url": json_public_url, # Bagong column para sa reflow
-                "status": "processed_reflow" # Bagong status
-            }, on_conflict="issue_slug").execute()
+            supabase = get_supabase_client() # <-- Gamitin din dito
+            issue_slug = slugify(issue_name) # Siguraduhing may slugify function ka
+            supabase.table("magazine_issues").upsert(
+                {
+                    "issue_number": issue_name,
+                    "issue_slug": issue_slug,
+                    "publication_date": config.publication_date,
+                    "reflow_content_url": json_public_url,
+                    "status": "processed_reflow"
+                },
+                on_conflict="issue_slug" 
+            ).execute()
             print("  - ✅ Database updated successfully.")
         except Exception as e:
             print(f"  - ❌ Database update failed. Error: {e}")

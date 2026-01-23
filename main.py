@@ -33,15 +33,15 @@ async def create_processing_job(request: ProcessRequest, background_tasks: Backg
         config = request.config
         background_tasks.add_task(process_pdf_from_url,
                                   request.pdf_file_id,
-                                  config.get('issue_number'),
-                                  config.get('publication_date'),
-                                  config.get('table_of_contents', []) # Magbigay ng empty list bilang default)
+                                  config.issue_number,
+                                  config.publication_date,
+                                  config.table_of_contents
         )
         
-        print(f"Accepted job for issue: {config.get('issue_number')}. Processing in background.")
+        print(f"Accepted job for issue: {config.issue_number}. Processing in background.")
         
         # Agad na mag-return ng 202 Accepted response
-        return {"message": "Processing job accepted", "issue_name": config.get('issue_number')}
+        return {"message": "Processing job accepted", "issue_name": config.issue_number}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
