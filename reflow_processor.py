@@ -73,6 +73,8 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
             continue
         
         spans_in_block = []
+        # Mag-declare ng isang counter para sa buong block
+        span_counter_in_block = 0
         for line_idx, line in enumerate(block.get("lines", [])):
             for span_idx, span in enumerate(line.get("spans", [])):
                 # Linisin ang text, minsan may kasamang weird whitespace
@@ -82,7 +84,7 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
 
                 # I-store ang lahat ng spans sa isang temporary list
                 spans_in_block.append({
-                    "id": f"p{page_number}_b{block_idx}_s{span_idx}",
+                    "id": f"p{page_number}_b{block_idx}_s{span_counter_in_block}",
                     "block_id": f"p{page_number}_b{block_idx}",
                     "type": "text",
                     "bbox": span["bbox"],
@@ -94,6 +96,7 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
                     },
                     "reflow_hints": {} # Placeholder para sa ating "intelligent" hula
                 })
+                span_counter_in_block += 1
 
         # --- Step 3: Shadow Text Detection Logic (within the same block) ---
         # Pagkatapos kolektahin lahat ng spans sa isang block, i-compare sila
