@@ -103,6 +103,47 @@ def detect_columns(page: fitz.Page, blocks: List[Dict[str, Any]], tolerance_px: 
         
     return column_bboxes
 
+# --- ✨ BAGONG HELPER: "PER-BLOCK" COLUMN DETECTION ✨ ---
+def detect_columns_within_block(spans: List[Dict[str, Any]], block_bbox: fitz.Rect, tolerance_px: int = 10) -> List[fitz.Rect]:
+    """
+    Analyzes span positions WITHIN a single block to detect internal columns.
+    Returns a list of bounding boxes for each detected column, relative to the block.
+    """
+    if not spans:
+        return [block_bbox]
+
+    # Step 1: Kunin ang horizontal center ng bawat span
+    center_points = sorted([((s['bbox'][0] + s['bbox'][2]) / 2) for s in spans])
+
+    if not center_points:
+        return [block_bbox]
+
+    # Step 2: I-cluster ang mga center points (parehong logic tulad ng dati)
+    clusters = []
+    current_cluster = [center_points[0]]
+    for i in range(1, len(center_points)):
+        if center_points[i] - current_cluster[-1] < tolerance_px:
+            current_cluster.append(center_points[i])
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [center_points[i]]
+    clusters.append(current_cluster)
+
+    column_x_centers = [sum(c) / len(c) for c in clusters]
+    
+    # Kung isa lang ang column, ang buong block ang column
+    if len(column_x_centers) <= 1:
+        return [block_bbox]
+
+    # Step 3: I-define ang boundaries ng bawat column sa loob ng block
+    column_bboxes = []
+    for i, center_x in enumerate(column_x_centers):
+        x0 = (center_x + column_x_centers[i-1]) / 2 if i > 0 else block_bbox.x0
+        x1 = (center_x + column_x_centers[i+1]) / 2 if i < len(column_x_centers) - 1 else block_bbox.x1
+        column_bboxes.append(fitz.Rect(x0, block_bbox.y0, x1, block_bbox.y1))
+
+    return column_bboxes
+
 def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: bytes, content_type: str):
     """Helper function para mag-upload ng file sa Supabase Storage."""
     try:
@@ -135,63 +176,52 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
     
    # --- Step 1: Process Text Spans with new heuristics ---
     text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
-    text_blocks = [b for b in text_dict.get("blocks", []) if b['type'] == 0]
-    # I-detect ang columns base sa mga text blocks
-    # Ang tolerance ay pwedeng i-adjust. Mas malaki = mas maluwag sa pag-cluster.
-    column_layout = detect_columns(page, text_blocks, tolerance_px=page.rect.width * 0.1)
-    column_count = len(column_layout)
-
     for block_idx, block in enumerate(text_dict.get("blocks", [])):
         if block['type'] != 0: continue
-        
-        # --- ✨ ALIGNMENT DETECTION (at the block level) ✨ ---
-        block_bbox = fitz.Rect(block['bbox'])
-        block_center_x = (block_bbox.x0 + block_bbox.x1) / 2
-        
-        # Heuristic: Kung ang gitna ng text block ay malapit sa gitna ng page,
-        # i-assume na ang buong block ay naka-center.
-        # Ang tolerance ay 5% ng page width.
-        alignment = "left" # Default alignment
-        if abs(block_center_x - page_center_x) < (page_width * 0.05):
-            alignment = "center"
-            print(f"      - Detected centered block: p{page_number}_b{block_idx}")
 
-        spans_in_block = []
-        span_counter_in_block = 0
-        for line_idx, line in enumerate(block.get("lines", [])):
-            for span_idx, span in enumerate(line.get("spans", [])):
-                span_text = span['text'].strip()
-                if not span_text: continue
-                # ✨ Assign span to a column ✨
-                span_center_x = (span['bbox'][0] + span['bbox'][2]) / 2
-                col_idx = 0
-                for i, col_bbox in enumerate(column_layout):
-                    if col_bbox.x0 <= span_center_x < col_bbox.x1:
-                        col_idx = i
-                        break
-                spans_in_block.append({
-                    "id": f"p{page_number}_b{block_idx}_s{span_counter_in_block}",
-                    "block_id": f"p{page_number}_b{block_idx}",
-                    "type": "text", "bbox": span["bbox"], "content": span_text,
-                    "font_info": {
-                        "size": round(span["size"], 2),
-                        "font": span["font"],
-                        # ✨ GAMITIN ANG BAGONG COLOR CONVERSION FUNCTION ✨
-                        "color": int_to_hex_color(span["color"]),
-                    },
-                    "reflow_hints": {
-                        # Idagdag ang alignment hint sa bawat span
-                        "alignment": alignment,
-                        "layout_info": {"column_count": column_count, "column_index": col_idx}
-                    }
-                })
-                span_counter_in_block += 1
+        block_bbox = fitz.Rect(block['bbox'])
+        
+        # Kunin lahat ng spans sa loob ng block na ito
+        spans_in_block_raw = [s for line in block.get("lines", []) for s in line.get("spans", []) if s['text'].strip()]
+        
+        # --- Step 2: I-detect ang columns SA LOOB ng block na ito ---
+        # Ang tolerance ay pwedeng mas maliit ngayon dahil block-level na
+        column_layout = detect_columns_within_block(spans_in_block_raw, block_bbox, tolerance_px=20)
+        column_count = len(column_layout)
+        if column_count > 1:
+            print(f"      - Block p{page_number}_b{block_idx} has {column_count} internal columns.")
+
+        # --- Step 3: I-proseso ang bawat span at i-assign sa column ng block ---
+        spans_in_block_processed = []
+        for span_counter, span in enumerate(spans_in_block_raw):
+            # Alignment detection (para sa buong block)
+            block_center_x = (block_bbox.x0 + block_bbox.x1) / 2
+            alignment = "center" if abs(block_center_x - page_center_x) < (page_width * 0.05) else "left"
+
+            # Assign span to its column within the block
+            span_center_x = (span['bbox'][0] + span['bbox'][2]) / 2
+            col_idx = 0
+            for i, col_bbox in enumerate(column_layout):
+                if col_bbox.x0 <= span_center_x < col_bbox.x1:
+                    col_idx = i
+                    break
+            
+            spans_in_block_processed.append({
+                "id": f"p{page_number}_b{block_idx}_s{span_counter}",
+                "block_id": f"p{page_number}_b{block_idx}",
+                "type": "text", "bbox": span["bbox"], "content": span['text'].strip(),
+                "font_info": {"size": round(span["size"], 2), "font": span["font"], "color": int_to_hex_color(span["color"])},
+                "reflow_hints": {
+                    "alignment": alignment,
+                    "layout_info": {"column_count": column_count, "column_index": col_idx}
+                }
+            })
 
         # --- Shadow Text Detection (walang pagbabago) ---
         final_spans_for_block = []
-        for i, current_span in enumerate(spans_in_block):
+        for i, current_span in enumerate(spans_in_block_processed):
             is_shadow = False
-            for j, other_span in enumerate(spans_in_block):
+            for j, other_span in enumerate(spans_in_block_processed):
                 if i == j: continue
                 if current_span['content'] == other_span['content']:
                     dist_x = abs(current_span['bbox'][0] - other_span['bbox'][0])
@@ -235,17 +265,17 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
         if public_url:
             elements.append({
                 "id": f"p{page_number}_img_{xref}",
-                "block_id": None, # Ang mga imahe ay walang block sa text_dict
+                "block_id": f"p{page_number}_img_block_{xref}",
                 "type": "image",
                 "bbox": bbox,
                 "src": public_url,
                 "reflow_hints": {
-                    "layout_info": {"column_count": column_count, "column_index": col_idx}
+                    "layout_info": {"column_count": 1, "column_index": 0}
                 }
             })
 
     # --- Step 5: Sort all elements by their vertical position (walang pagbabago) ---
-    elements.sort(key=lambda el: el["bbox"][1])
+    # elements.sort(key=lambda el: el["bbox"][1])
 
     print(f"    - Extracted {len(elements)} granular elements.")
 
