@@ -43,6 +43,66 @@ def int_to_hex_color(color_int: int) -> str:
     # Format as a 6-digit hex string with leading zeros if needed
     return f"#{color_int:06x}"
 
+def detect_columns(page: fitz.Page, blocks: List[Dict[str, Any]], tolerance_px: int = 10) -> List[fitz.Rect]:
+    """
+    Analyzes text block positions to detect column layout.
+    Returns a list of bounding boxes, one for each detected column.
+    """
+    if not blocks:
+        return [page.rect] # Kung walang blocks, i-assume na 1 column (buong page)
+
+    # Step 1: Kunin ang horizontal center ng bawat block
+    center_points = sorted([((b['bbox'][0] + b['bbox'][2]) / 2) for b in blocks])
+
+    if not center_points:
+        return [page.rect]
+
+    # Step 2: I-cluster ang mga center points
+    clusters = []
+    current_cluster = [center_points[0]]
+    
+    for i in range(1, len(center_points)):
+        # Kung ang agwat sa pagitan ng dalawang center points ay maliit, nasa iisang cluster sila
+        if center_points[i] - current_cluster[-1] < tolerance_px:
+            current_cluster.append(center_points[i])
+        else:
+            # Kung malaki ang agwat, simulan ang bagong cluster
+            clusters.append(current_cluster)
+            current_cluster = [center_points[i]]
+    clusters.append(current_cluster)
+
+    # Step 3: I-calculate ang average center ng bawat cluster
+    # Ito ang magiging representative x-coordinate ng bawat column
+    column_x_centers = [sum(c) / len(c) for c in clusters]
+    print(f"      - Detected {len(column_x_centers)} potential column centers at x-coords: {[round(c) for c in column_x_centers]}")
+
+    # Step 4: I-define ang boundaries (bbox) ng bawat column
+    column_bboxes = []
+    page_width = page.rect.width
+    
+    # Kung isa lang ang column, sakupin ang buong page
+    if len(column_x_centers) <= 1:
+        return [page.rect]
+
+    # Kung marami, hatiin ang page
+    for i, center_x in enumerate(column_x_centers):
+        # Define ang left (x0) at right (x1) boundary ng column
+        if i == 0:
+            x0 = 0
+        else:
+            # Ang gitna sa pagitan ng kasalukuyang center at ng nakaraang center
+            x0 = (center_x + column_x_centers[i-1]) / 2
+        
+        if i == len(column_x_centers) - 1:
+            x1 = page_width
+        else:
+            # Ang gitna sa pagitan ng kasalukuyang center at ng susunod na center
+            x1 = (center_x + column_x_centers[i+1]) / 2
+            
+        column_bboxes.append(fitz.Rect(x0, 0, x1, page.rect.height))
+        
+    return column_bboxes
+
 def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: bytes, content_type: str):
     """Helper function para mag-upload ng file sa Supabase Storage."""
     try:
@@ -75,6 +135,12 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
     
    # --- Step 1: Process Text Spans with new heuristics ---
     text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
+    text_blocks = [b for b in text_dict.get("blocks", []) if b['type'] == 0]
+    # I-detect ang columns base sa mga text blocks
+    # Ang tolerance ay pwedeng i-adjust. Mas malaki = mas maluwag sa pag-cluster.
+    column_layout = detect_columns(page, text_blocks, tolerance_px=page.rect.width * 0.1)
+    column_count = len(column_layout)
+
     for block_idx, block in enumerate(text_dict.get("blocks", [])):
         if block['type'] != 0: continue
         
@@ -96,7 +162,13 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
             for span_idx, span in enumerate(line.get("spans", [])):
                 span_text = span['text'].strip()
                 if not span_text: continue
-
+                # ✨ Assign span to a column ✨
+                span_center_x = (span['bbox'][0] + span['bbox'][2]) / 2
+                col_idx = 0
+                for i, col_bbox in enumerate(column_layout):
+                    if col_bbox.x0 <= span_center_x < col_bbox.x1:
+                        col_idx = i
+                        break
                 spans_in_block.append({
                     "id": f"p{page_number}_b{block_idx}_s{span_counter_in_block}",
                     "block_id": f"p{page_number}_b{block_idx}",
@@ -109,7 +181,8 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
                     },
                     "reflow_hints": {
                         # Idagdag ang alignment hint sa bawat span
-                        "alignment": alignment 
+                        "alignment": alignment,
+                        "layout_info": {"column_count": column_count, "column_index": col_idx}
                     }
                 })
                 span_counter_in_block += 1
@@ -152,7 +225,13 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
             file_body=image_bytes,
             content_type=f"image/{image_ext}"
         )
-
+        img_center_x = (bbox[0] + bbox[2]) / 2
+        col_idx = 0
+        for i, col_bbox in enumerate(column_layout):
+            if col_bbox.x0 <= img_center_x < col_bbox.x1:
+                col_idx = i
+                break
+        
         if public_url:
             elements.append({
                 "id": f"p{page_number}_img_{xref}",
@@ -160,7 +239,9 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
                 "type": "image",
                 "bbox": bbox,
                 "src": public_url,
-                "reflow_hints": {}
+                "reflow_hints": {
+                    "layout_info": {"column_count": column_count, "column_index": col_idx}
+                }
             })
 
     # --- Step 5: Sort all elements by their vertical position (walang pagbabago) ---
