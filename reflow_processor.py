@@ -36,6 +36,13 @@ def get_supabase_client() -> Client:
     
     return _supabase_client
 
+def int_to_hex_color(color_int: int) -> str:
+    """Converts an integer color representation to a CSS hex string."""
+    if not isinstance(color_int, int) or not 0 <= color_int <= 16777215:
+        return "#000000"  # Default to black for invalid input
+    # Format as a 6-digit hex string with leading zeros if needed
+    return f"#{color_int:06x}"
+
 def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: bytes, content_type: str):
     """Helper function para mag-upload ng file sa Supabase Storage."""
     try:
@@ -55,83 +62,77 @@ def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: byte
 
 def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_name: str, page_number: int) -> List[Dict[str, Any]]:
     """
-    Analyzes a single page for granular content elements (spans),
-    flags potential shadow text, and smart-crops images.
+    Analyzes a single page, adding alignment hints, converting colors,
+    and handling layout heuristics.
     """
-    print("    - Starting granular extraction...")
-    
-    # --- Step 1: Extract text blocks (dict) at image info ---
-    text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
-    image_info_list = page.get_image_info(xrefs=True)
+    print("    - Starting advanced layout analysis...")
 
+    # Kunin ang sukat ng page para sa alignment check
+    page_width = page.rect.width
+    page_center_x = page_width / 2
+    
     elements = []
     
-    # --- Step 2: Process Text Spans (Granular) ---
-    # I-iterate ang bawat block, line, at span
+   # --- Step 1: Process Text Spans with new heuristics ---
+    text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
     for block_idx, block in enumerate(text_dict.get("blocks", [])):
-        if block['type'] != 0:  # 0 = text block
-            continue
+        if block['type'] != 0: continue
         
+        # --- ✨ ALIGNMENT DETECTION (at the block level) ✨ ---
+        block_bbox = fitz.Rect(block['bbox'])
+        block_center_x = (block_bbox.x0 + block_bbox.x1) / 2
+        
+        # Heuristic: Kung ang gitna ng text block ay malapit sa gitna ng page,
+        # i-assume na ang buong block ay naka-center.
+        # Ang tolerance ay 5% ng page width.
+        alignment = "left" # Default alignment
+        if abs(block_center_x - page_center_x) < (page_width * 0.05):
+            alignment = "center"
+            print(f"      - Detected centered block: p{page_number}_b{block_idx}")
+
         spans_in_block = []
-        # Mag-declare ng isang counter para sa buong block
         span_counter_in_block = 0
         for line_idx, line in enumerate(block.get("lines", [])):
             for span_idx, span in enumerate(line.get("spans", [])):
-                # Linisin ang text, minsan may kasamang weird whitespace
                 span_text = span['text'].strip()
-                if not span_text:
-                    continue
+                if not span_text: continue
 
-                # I-store ang lahat ng spans sa isang temporary list
                 spans_in_block.append({
                     "id": f"p{page_number}_b{block_idx}_s{span_counter_in_block}",
                     "block_id": f"p{page_number}_b{block_idx}",
-                    "type": "text",
-                    "bbox": span["bbox"],
-                    "content": span_text,
+                    "type": "text", "bbox": span["bbox"], "content": span_text,
                     "font_info": {
                         "size": round(span["size"], 2),
                         "font": span["font"],
-                        "color": span["color"],
+                        # ✨ GAMITIN ANG BAGONG COLOR CONVERSION FUNCTION ✨
+                        "color": int_to_hex_color(span["color"]),
                     },
-                    "reflow_hints": {} # Placeholder para sa ating "intelligent" hula
+                    "reflow_hints": {
+                        # Idagdag ang alignment hint sa bawat span
+                        "alignment": alignment 
+                    }
                 })
                 span_counter_in_block += 1
 
-        # --- Step 3: Shadow Text Detection Logic (within the same block) ---
-        # Pagkatapos kolektahin lahat ng spans sa isang block, i-compare sila
+        # --- Shadow Text Detection (walang pagbabago) ---
         final_spans_for_block = []
         for i, current_span in enumerate(spans_in_block):
             is_shadow = False
-            # I-compare ang current_span sa lahat ng iba pang spans sa block
             for j, other_span in enumerate(spans_in_block):
-                if i == j:  # Huwag i-compare sa sarili niya
-                    continue
-
-                # Condition 1: Pareho ba ang text?
+                if i == j: continue
                 if current_span['content'] == other_span['content']:
-                    # Condition 2: Halos magkadikit ba ang position?
-                    # Check kung ang top-left corner nila ay napakaliit lang ang agwat
                     dist_x = abs(current_span['bbox'][0] - other_span['bbox'][0])
                     dist_y = abs(current_span['bbox'][1] - other_span['bbox'][1])
-                    
-                    # Kung ang agwat ay mas mababa sa 2 pixels, posibleng shadow ito
-                    if dist_x < 2 and dist_y < 2:
-                        # Condition 3: Alin ang nasa likod?
-                        # Ang span na unang na-render (mas mababang index sa original PDF structure)
-                        # ay malamang ang shadow.
-                        if j < i:
-                            is_shadow = True
-                            break # Found a shadow, no need to check further
-
+                    if dist_x < 2 and dist_y < 2 and j < i:
+                        is_shadow = True
+                        break
             current_span["reflow_hints"]["is_shadow_text"] = is_shadow
             final_spans_for_block.append(current_span)
         
-        # Idagdag ang na-filter na spans sa main elements list
         elements.extend(final_spans_for_block)
 
 
-    # --- Step 4: Process Images (Smart Cropping - walang pagbabago) ---
+    image_info_list = page.get_image_info(xrefs=True)
     for img_info in image_info_list:
         bbox = img_info['bbox']
         xref = img_info['xref']
@@ -164,9 +165,9 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
 
     # --- Step 5: Sort all elements by their vertical position (walang pagbabago) ---
     elements.sort(key=lambda el: el["bbox"][1])
-    
+
     print(f"    - Extracted {len(elements)} granular elements.")
-    
+
     # Sa ngayon, i-return natin ang buong listahan. Ang pag-alis ng `bbox` ay gagawin na sa front-end.
     return elements
 
@@ -183,10 +184,10 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
         drive_service = get_drive_service()
         request = drive_service.files().get_media(fileId=file_id)
         file_bytes = io.BytesIO(request.execute())
-        
+
         # 2. Open PDF
         pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
-        
+
         structured_magazine = {
             "issue_number": issue_name,
             "publication_date": config.publication_date,
@@ -202,7 +203,7 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
 
             # Ipasa ang buong `pdf_document` para ma-extract ang images
             page_content = reconstruct_page_layout(page, pdf_document, issue_name, page_number)
-            
+
             structured_magazine["pages"].append({
                 "page_number": page_number,
                 "content": page_content
@@ -212,7 +213,7 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
         print("\n--- Uploading final semantic JSON to Supabase ---")
         final_json_output = json.dumps(structured_magazine, indent=2).encode('utf-8')
         json_path = f"{issue_name}/content.json"
-        
+
         json_public_url = upload_to_supabase_storage(
             bucket_name="magazine-pages", # O kung saan mo gustong i-save ang JSON
             file_path=json_path,
