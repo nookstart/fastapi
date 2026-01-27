@@ -163,43 +163,34 @@ def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: byte
 
 def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_name: str, page_number: int) -> List[Dict[str, Any]]:
     """
-    Analyzes a single page, adding alignment hints, converting colors,
-    and handling layout heuristics.
+    Main analysis function, now with PER-BLOCK column detection and advanced element grouping.
     """
-    print("    - Starting advanced layout analysis...")
-
-    # Kunin ang sukat ng page para sa alignment check
+    print("    - Starting advanced layout analysis with element grouping...")
     page_width = page.rect.width
     page_center_x = page_width / 2
     
-    elements = []
-    
-   # --- Step 1: Process Text Spans with new heuristics ---
+    raw_elements = [] # Ito ang maglalaman ng lahat ng na-extract na spans at images
+
+    # --- Step 1: I-iterate ang bawat TEXT BLOCK ---
     text_dict = page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT)
     for block_idx, block in enumerate(text_dict.get("blocks", [])):
         if block['type'] != 0: continue
 
         block_bbox = fitz.Rect(block['bbox'])
-        
-        # Kunin lahat ng spans sa loob ng block na ito
         spans_in_block_raw = [s for line in block.get("lines", []) for s in line.get("spans", []) if s['text'].strip()]
         
-        # --- Step 2: I-detect ang columns SA LOOB ng block na ito ---
-        # Ang tolerance ay pwedeng mas maliit ngayon dahil block-level na
         column_layout = detect_columns_within_block(spans_in_block_raw, block_bbox, tolerance_px=20)
         column_count = len(column_layout)
-        if column_count > 1:
-            print(f"      - Block p{page_number}_b{block_idx} has {column_count} internal columns.")
 
-        # --- Step 3: I-proseso ang bawat span at i-assign sa column ng block ---
         spans_in_block_processed = []
-        for span_counter, span in enumerate(spans_in_block_raw):
+        span_counter_in_block = 0 # Use a separate counter for unique span IDs within the block
+        for span_raw in spans_in_block_raw: # Iterate directly over the raw spans
             # Alignment detection (para sa buong block)
             block_center_x = (block_bbox.x0 + block_bbox.x1) / 2
             alignment = "center" if abs(block_center_x - page_center_x) < (page_width * 0.05) else "left"
 
             # Assign span to its column within the block
-            span_center_x = (span['bbox'][0] + span['bbox'][2]) / 2
+            span_center_x = (span_raw['bbox'][0] + span_raw['bbox'][2]) / 2
             col_idx = 0
             for i, col_bbox in enumerate(column_layout):
                 if col_bbox.x0 <= span_center_x < col_bbox.x1:
@@ -207,17 +198,18 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
                     break
             
             spans_in_block_processed.append({
-                "id": f"p{page_number}_b{block_idx}_s{span_counter}",
+                "id": f"p{page_number}_b{block_idx}_s{span_counter_in_block}",
                 "block_id": f"p{page_number}_b{block_idx}",
-                "type": "text", "bbox": span["bbox"], "content": span['text'].strip(),
-                "font_info": {"size": round(span["size"], 2), "font": span["font"], "color": int_to_hex_color(span["color"])},
+                "type": "text", "bbox": span_raw["bbox"], "content": span_raw['text'].strip(),
+                "font_info": {"size": round(span_raw["size"], 2), "font": span_raw["font"], "color": int_to_hex_color(span_raw["color"])},
                 "reflow_hints": {
                     "alignment": alignment,
                     "layout_info": {"column_count": column_count, "column_index": col_idx}
                 }
             })
+            span_counter_in_block += 1 # Increment counter for unique ID
 
-        # --- Shadow Text Detection (walang pagbabago) ---
+        # Shadow Text Detection
         final_spans_for_block = []
         for i, current_span in enumerate(spans_in_block_processed):
             is_shadow = False
@@ -232,9 +224,10 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
             current_span["reflow_hints"]["is_shadow_text"] = is_shadow
             final_spans_for_block.append(current_span)
         
-        elements.extend(final_spans_for_block)
+        raw_elements.extend(final_spans_for_block)
 
 
+    # --- Step 2: Process Images ---
     image_info_list = page.get_image_info(xrefs=True)
     for img_info in image_info_list:
         bbox = img_info['bbox']
@@ -244,43 +237,114 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
         zoom_matrix = fitz.Matrix(2, 2)
         pix = page.get_pixmap(matrix=zoom_matrix, clip=bbox)
         image_bytes = pix.tobytes("png")
-        image_ext = "png"
-
-        image_filename = f"page_{page_number}_xref_{xref}_cropped.{image_ext}"
+        
+        image_filename = f"page_{page_number}_xref_{xref}_cropped.png"
         supabase_path = f"{issue_name}/images/{image_filename}"
         
         public_url = upload_to_supabase_storage(
-            bucket_name="magazine-pages",
-            file_path=supabase_path,
-            file_body=image_bytes,
-            content_type=f"image/{image_ext}"
+            bucket_name="magazine-pages", file_path=supabase_path,
+            file_body=image_bytes, content_type="image/png"
         )
-        img_center_x = (bbox[0] + bbox[2]) / 2
-        col_idx = 0
-        for i, col_bbox in enumerate(column_layout):
-            if col_bbox.x0 <= img_center_x < col_bbox.x1:
-                col_idx = i
-                break
+        
+        # Assign image to a column (page-level column, for now, or default to 1-column block)
+        # For images, we'll treat them as 1-column blocks for now,
+        # but we still need to assign them a column_index if they are part of a page-level grid.
+        # For simplicity, let's assume images are always in column 0 of their own block.
         
         if public_url:
-            elements.append({
+            raw_elements.append({
                 "id": f"p{page_number}_img_{xref}",
-                "block_id": f"p{page_number}_img_block_{xref}",
-                "type": "image",
-                "bbox": bbox,
-                "src": public_url,
+                "block_id": f"p{page_number}_img_block_{xref}", # Each image is its own block
+                "type": "image", "bbox": bbox, "src": public_url,
                 "reflow_hints": {
-                    "layout_info": {"column_count": 1, "column_index": 0}
+                    "layout_info": {"column_count": 1, "column_index": 0} # Default to 1-column block
                 }
             })
 
-    # --- Step 5: Sort all elements by their vertical position (walang pagbabago) ---
-    # elements.sort(key=lambda el: el["bbox"][1])
+    # --- ✨ Step 3: ADVANCED ELEMENT GROUPING (Re-clustering) ✨ ---
+    # Ito ang bagong logic para i-handle ang interleaved elements
+    
+    # Sort muna ang lahat ng raw elements by their top position (y0)
+    raw_elements.sort(key=lambda el: el["bbox"][1])
+    
+    grouped_elements = []
+    current_group = []
 
-    print(f"    - Extracted {len(elements)} granular elements.")
+    for i, el in enumerate(raw_elements):
+        if not current_group:
+            current_group.append(el)
+            continue
 
-    # Sa ngayon, i-return natin ang buong listahan. Ang pag-alis ng `bbox` ay gagawin na sa front-end.
-    return elements
+        last_el_in_group = current_group[-1]
+
+        # Heuristic: Kung ang current element ay parehong type at malapit sa last element
+        # (vertically at horizontally), i-group sila.
+        # Ang tolerance ay pwedeng i-adjust.
+        vertical_overlap_threshold = 5 # pixels
+        horizontal_overlap_threshold = 5 # pixels
+        
+        # Check for vertical proximity (top of current element is close to bottom of last element)
+        is_vertically_close = (el["bbox"][1] - last_el_in_group["bbox"][3]) < vertical_overlap_threshold
+        
+        # Check for horizontal overlap (they are roughly in the same horizontal space)
+        # Check if their x-ranges overlap significantly
+        horizontal_overlap = max(0, min(el["bbox"][2], last_el_in_group["bbox"][2]) - max(el["bbox"][0], last_el_in_group["bbox"][0]))
+        min_width = min(el["bbox"][2] - el["bbox"][0], last_el_in_group["bbox"][2] - last_el_in_group["bbox"][0])
+        is_horizontally_overlapping = horizontal_overlap > (min_width * 0.5) # Overlap by at least 50% of the narrower element
+
+        # Condition for grouping:
+        # 1. Same type (text with text, image with image)
+        # 2. Vertically close
+        # 3. Horizontally overlapping
+        if (el["type"] == last_el_in_group["type"] and
+            is_vertically_close and
+            is_horizontally_overlapping):
+            
+            current_group.append(el)
+        else:
+            # Simulan ang bagong group
+            grouped_elements.append(current_group)
+            current_group = [el]
+    
+    if current_group:
+        grouped_elements.append(current_group)
+
+    # Ngayon, i-flatten ang grouped_elements pabalik sa isang listahan ng elements
+    # Pero i-update ang block_id ng mga na-group na elements
+    final_elements = []
+    for group_idx, group in enumerate(grouped_elements):
+        # Kung ang group ay may maraming elements, bigyan sila ng parehong block_id
+        if len(group) > 1:
+            # Gumawa ng bagong block_id para sa group na ito
+            group_block_id = f"p{page_number}_grouped_block_{group_idx}"
+            for el in group:
+                el["block_id"] = group_block_id
+                final_elements.append(el)
+        else:
+            # Kung isa lang, gamitin ang existing block_id
+            final_elements.extend(group)
+
+    # --- Step 4: Background Image Heuristics (walang pagbabago) ---
+    # Ito ay tatakbo sa final_elements
+    text_elements = [el for el in final_elements if el['type'] == 'text']
+    image_elements = [el for el in final_elements if el['type'] == 'image']
+    for text_el in text_elements:
+        text_bbox = fitz.Rect(text_el['bbox'])
+        for image_el in image_elements:
+            image_bbox = fitz.Rect(image_el['bbox'])
+            if image_bbox.contains(text_bbox):
+                image_el['reflow_hints']['is_background'] = True
+                if 'background_image_id' not in text_el['reflow_hints']:
+                    text_el['reflow_hints']['background_image_id'] = image_el['id']
+                break 
+
+    # --- Step 5: Final Sorting (optional, dahil na-sort na natin ang raw_elements) ---
+    # Pero para masigurado, i-sort ulit base sa block_id at y0
+    final_elements.sort(key=lambda el: (el["block_id"], el["bbox"][1]))
+    
+    print(f"    - Extracted and grouped {len(final_elements)} elements.")
+    
+    return final_elements
 
 def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]:
     """
