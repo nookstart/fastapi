@@ -11,31 +11,6 @@ from slugify import slugify
 from processor import get_drive_service, save_to_database # Gagamitin natin ang save_to_database mamaya
 from models import ReflowConfig
 
-# --- ✨ BAGONG ROBUST SUPABASE CLIENT GETTER ✨ ---
-_supabase_client = None
-
-def get_supabase_client() -> Client:
-    """
-    Initializes and returns a singleton Supabase client.
-    Raises an exception if credentials are not set.
-    """
-    global _supabase_client
-    if _supabase_client is None:
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
-
-        if not supabase_url or not supabase_key:
-            raise ValueError("Supabase URL and Key must be set in environment variables.")
-        
-        # Siguraduhin na may trailing slash
-        if not supabase_url.endswith('/'):
-            supabase_url += '/'
-            
-        print("Initializing Supabase client...")
-        _supabase_client = create_client(supabase_url, supabase_key)
-    
-    return _supabase_client
-
 def int_to_hex_color(color_int: int) -> str:
     """Converts an integer color representation to a CSS hex string."""
     if not isinstance(color_int, int) or not 0 <= color_int <= 16777215:
@@ -144,10 +119,9 @@ def detect_columns_within_block(spans: List[Dict[str, Any]], block_bbox: fitz.Re
 
     return column_bboxes
 
-def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: bytes, content_type: str):
+def upload_to_supabase_storage(supabase: Client, bucket_name: str, file_path: str, file_body: bytes, content_type: str):
     """Helper function para mag-upload ng file sa Supabase Storage."""
     try:
-        supabase = get_supabase_client() # <-- Gamitin ang bagong function
         supabase.storage.from_(bucket_name).upload(
             file=file_body,
             path=file_path,
@@ -161,7 +135,12 @@ def upload_to_supabase_storage(bucket_name: str, file_path: str, file_body: byte
         print(f"  - ❌ Supabase upload failed for {file_path}. Error Type: {type(e).__name__}, Details: {e}")
         return None
 
-def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_name: str, page_number: int) -> List[Dict[str, Any]]:
+def reconstruct_page_layout(
+        supabase: Client,
+        page: fitz.Page,
+        pdf_document: fitz.Document,
+        issue_name: str,
+        page_number: int) -> List[Dict[str, Any]]:
     """
     Main analysis function, now with PER-BLOCK column detection and advanced element grouping.
     """
@@ -242,8 +221,11 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
         supabase_path = f"{issue_name}/images/{image_filename}"
         
         public_url = upload_to_supabase_storage(
-            bucket_name="magazine-pages", file_path=supabase_path,
-            file_body=image_bytes, content_type="image/png"
+            supabase,
+            bucket_name="magazine-pages",
+            file_path=supabase_path,
+            file_body=image_bytes,
+            content_type="image/png"
         )
         
         # Assign image to a column (page-level column, for now, or default to 1-column block)
@@ -346,7 +328,7 @@ def reconstruct_page_layout(page: fitz.Page, pdf_document: fitz.Document, issue_
     
     return final_elements
 
-def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]:
+def process_pdf_for_reflow(file_id: str, config: ReflowConfig, supabase: Client) -> Dict[str, Any]:
     """
     Main function to process the PDF for reflow.
     """
@@ -377,7 +359,7 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
             print(f"\n--- Reconstructing Page {page_number} ---")
 
             # Ipasa ang buong `pdf_document` para ma-extract ang images
-            page_content = reconstruct_page_layout(page, pdf_document, issue_name, page_number)
+            page_content = reconstruct_page_layout(supabase, page, pdf_document, issue_name, page_number)
 
             structured_magazine["pages"].append({
                 "page_number": page_number,
@@ -390,6 +372,7 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
         json_path = f"{issue_name}/content.json"
 
         json_public_url = upload_to_supabase_storage(
+            supabase,
             bucket_name="magazine-pages", # O kung saan mo gustong i-save ang JSON
             file_path=json_path,
             file_body=final_json_output,
@@ -402,7 +385,6 @@ def process_pdf_for_reflow(file_id: str, config: ReflowConfig) -> Dict[str, Any]
         # 5. I-UPDATE ANG DATABASE
         print("\n--- Updating 'magazine_issues' table in Supabase DB ---")
         try:
-            supabase = get_supabase_client() # <-- Gamitin din dito
             issue_slug = slugify(issue_name) # Siguraduhing may slugify function ka
             supabase.table("magazine_issues").upsert(
                 {
