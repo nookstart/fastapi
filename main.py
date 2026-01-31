@@ -6,9 +6,10 @@ from processor import process_pdf_from_url
 
 from processor import process_pdf_from_url
 from reflow_processor import process_pdf_for_reflow
+from interactive_processor import process_pdf_interactive
 from models import ProcessRequest, ReflowRequest
-from supabase import create_client, Client
 
+from supabase import create_client, Client
 # I-load ang environment variables mula sa .env file (para sa local dev)
 load_dotenv()
 
@@ -106,3 +107,23 @@ async def trigger_reflow_pdf(
 @app.get("/")
 def read_root():
     return {"status": "Magazine Worker is running"}
+
+@app.post("/process-interactive")
+async def trigger_process_pdf_interactive(
+    request: ProcessRequest, 
+    background_tasks: BackgroundTasks,
+    supabase: Client = Depends(get_supabase)
+    ):
+    """
+    The new endpoint that will create a manifest with detailed element hotspots.
+    """
+    try:
+        background_tasks.add_task(
+            process_pdf_interactive, # <-- Tinatawag na nito ang bagong function
+            request.pdf_file_id, 
+            request.config,
+            supabase # <-- ✨ At ipasa ito sa background task ✨
+        )
+        return {"message": f"Accepted INTERACTIVE processing job for issue: {request.config.issue_number}."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
