@@ -6,6 +6,9 @@ from googleapiclient.discovery import build
 from io import BytesIO
 from supabase import create_client, Client
 from PIL import Image, ImageChops
+from slugify import slugify
+from datetime import datetime
+
 # --- Google Drive Authentication ---
 def get_drive_service():
     client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -57,14 +60,20 @@ def upload_to_supabase_storage(supabase: Client, bucket_name: str, file_path: st
 # --- Main Interactive Processor Function ---
 def process_pdf_interactive(pdf_file_id: str, config: dict, supabase: Client):
     issue_name = config.issue_number
+    issue_slug = slugify(issue_name)
     print(f"--- 🚀 INTERACTIVE PROCESSOR INITIATED for: {issue_name} 🚀 ---")
     
     try:
         pdf_data = download_pdf_from_drive(pdf_file_id)
         pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
         
-        manifest = {"pages": []}
-        
+        manifest = {
+            "issue_number": issue_name,
+            "publication_date": config.publication_date,
+            "table_of_contents": config.table_of_contents, # <-- Idagdag ang TOC
+            "pages": []
+        }
+
         for page_num in range(len(pdf_document)):
             page = pdf_document.load_page(page_num)
             print(f"\n--- Processing Page {page_num + 1} ---")
@@ -160,11 +169,28 @@ def process_pdf_interactive(pdf_file_id: str, config: dict, supabase: Client):
         # ... (ang natitirang bahagi ng code para sa pag-upload ng manifest ay mananatiling pareho) ...
         manifest_path = f"{issue_name}/manifest.json"
         print(f"\n--- Uploading final manifest to: {manifest_path} ---")
-        upload_to_supabase_storage(
+        manifest_url = upload_to_supabase_storage(
             supabase, "magazine-pages", manifest_path,
             json.dumps(manifest, indent=2).encode('utf-8'), "application/json"
         )
+        print(f"--- Updating 'magazine_issues' table for slug: {issue_slug} ---")
+        db_payload = {
+            "issue_number": issue_name,
+            "issue_slug": issue_slug,
+            "publication_date": config.publication_date,
+            "status": "published_interactive", # Isang bagong status para malinaw
+            "manifest_url": manifest_url,
+            # Ang cover_image_url ay maaaring i-set dito kung kukunin natin ang first page
+            "cover_image_url": manifest['pages'][0]['image_url'] if manifest['pages'] else None,
+        }
         
+        # Ang `upsert` na may `on_conflict` ay nagsisigurong idempotent ito.
+        # I-u-update nito ang existing entry kung may kaparehong 'issue_slug', kung hindi, gagawa ito ng bago.
+        supabase.table("magazine_issues").upsert(
+            db_payload, 
+            on_conflict="issue_slug"
+        ).execute()
+        print("  - ✅ Database updated successfully.")
         print(f"--- ✅ INTERACTIVE PROCESSING COMPLETE for: {issue_name} ---")
 
     except Exception as e:
