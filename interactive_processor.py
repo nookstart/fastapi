@@ -5,7 +5,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from io import BytesIO
 from supabase import create_client, Client
-
+from PIL import Image, ImageChops
 # --- Google Drive Authentication ---
 def get_drive_service():
     client_email = os.getenv("GOOGLE_CLIENT_EMAIL")
@@ -69,22 +69,56 @@ def process_pdf_interactive(pdf_file_id: str, config: dict, supabase: Client):
             page = pdf_document.load_page(page_num)
             print(f"\n--- Processing Page {page_num + 1} ---")
 
-            zoom_matrix = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=zoom_matrix)
-            page_image_bytes = pix.tobytes("png")
-            page_image_path = f"{issue_name}/page_{page_num + 1}.png"
+            # --- ✨ STEP 1: AUTOCROP LOGIC (Mula sa lumang processor) ✨ ---
+            dpi = 150  # Itakda ang DPI para sa initial render
+            pix_full = page.get_pixmap(dpi=dpi)
+            img_bytes_full = pix_full.tobytes("png")
+
+            print("  - Analyzing image for autocropping...")
+            image = Image.open(BytesIO(img_bytes_full))
+            grayscale_image = image.convert('L')
+            inverted_image = ImageChops.invert(grayscale_image)
+            autocrop_pixel_bbox = inverted_image.getbbox()
+
+            if autocrop_pixel_bbox:
+                print(f"  - Content found at pixel bbox: {autocrop_pixel_bbox}. Cropping...")
+                cropped_image = image.crop(autocrop_pixel_bbox)
+                
+                buffer = BytesIO()
+                cropped_image.save(buffer, format='PNG')
+                page_image_bytes = buffer.getvalue() # Ito na ang final bytes na ia-upload
+
+                # Kunin ang dimensions ng na-crop na imahe
+                final_width = cropped_image.width
+                final_height = cropped_image.height
+                
+                # I-convert ang pixel bbox pabalik sa PDF points para sa frontend
+                scale = dpi / 72.0
+                x0, y0, x1, y1 = autocrop_pixel_bbox
+                final_content_box = [x0 / scale, y0 / scale, x1 / scale, y1 / scale]
+            else:
+                # Fallback kung mag-fail ang autocrop
+                print("  - ⚠️ Autocrop failed. Using full page image.")
+                page_image_bytes = img_bytes_full
+                final_width = pix_full.width
+                final_height = pix_full.height
+                final_content_box = [page.rect.x0, page.rect.y0, page.rect.x1, page.rect.y1]
             
+            # --- ✨ STEP 2: I-UPLOAD ANG NA-CROP NA IMAHE ✨ ---
+            page_image_path = f"{issue_name}/page_{page_num + 1}.png"
             page_image_url = upload_to_supabase_storage(
-                supabase, "magazine-pages", page_image_path, page_image_bytes, "image/png"
+                supabase, "magazine-pages", page_image_path, 
+                page_image_bytes, # <-- Gamit na nito ang na-crop na bytes
+                "image/png"
             )
 
+            # --- STEP 3: I-EXTRACT ANG HOTSPOTS (walang pagbabago) ---
             hotspots = [
                 {"type": "url", "uri": link['uri'], "bbox": [link['from'].x0, link['from'].y0, link['from'].x1, link['from'].y1]}
                 for link in page.get_links() if link['kind'] == fitz.LINK_URI
             ]
             
             element_hotspots = []
-            
             print("  - Extracting text blocks...")
             text_blocks = page.get_text("blocks")
             for block in text_blocks:
@@ -101,24 +135,29 @@ def process_pdf_interactive(pdf_file_id: str, config: dict, supabase: Client):
                     img_pix = page.get_pixmap(clip=img_info['bbox'])
                     img_bytes = img_pix.tobytes("png")
                     img_path = f"{issue_name}/elements/element_page_{page_num + 1}_xref_{img_info['xref']}.png"
-                    
                     img_url = upload_to_supabase_storage(
                         supabase, "magazine-pages", img_path, img_bytes, "image/png"
                     )
-
                     if img_url:
                         element_hotspots.append({
                             "type": "image", "bbox": list(img_info['bbox']), "src": img_url
                         })
                 except Exception as e:
-                    print(f"    - ⚠️ Could not process image with xref {img_info['xref']}. Reason: {e}")
+                    print(f"    - ⚠️ Could not process image element with xref {img_info['xref']}. Reason: {e}")
 
+            # --- ✨ STEP 4: I-UPDATE ANG MANIFEST DATA ✨ ---
             manifest["pages"].append({
-                "page_num": page_num + 1, "image_url": page_image_url, "width": pix.width,
-                "height": pix.height, "hotspots": hotspots, "element_hotspots": element_hotspots
+                "page_num": page_num + 1,
+                "image_url": page_image_url,
+                "width": final_width,             # <-- Gamitin ang bagong width
+                "height": final_height,           # <-- Gamitin ang bagong height
+                "crop_box": final_content_box,    # <-- Idagdag ang crop_box
+                "hotspots": hotspots,
+                "element_hotspots": element_hotspots
             })
-            print(f"  - ✅ Found {len(hotspots)} basic hotspots and {len(element_hotspots)} element hotspots.")
+            print(f"  - ✅ Page processed. Final dimensions: {final_width}x{final_height}")
 
+        # ... (ang natitirang bahagi ng code para sa pag-upload ng manifest ay mananatiling pareho) ...
         manifest_path = f"{issue_name}/manifest.json"
         print(f"\n--- Uploading final manifest to: {manifest_path} ---")
         upload_to_supabase_storage(
